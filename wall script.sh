@@ -1,0 +1,152 @@
+#!/usr/bin/env bash
+
+declare -r LOGFILE="$HOME/.var/log/wallchanger.log"
+declare -r FOLDER="$1"
+declare -r TIMEOUT="$2"
+declare -r FALLBACK="$3"
+
+log() {
+    if [[ "$LOGFILE" ]]; then
+        echo -e "[$(date +%FT%T)] $*" >> "$LOGFILE"
+    fi
+}
+
+output() {
+    echo -e $*
+    log $*
+}
+
+error() {
+    msg="[E] $*"
+    echo -e $msg >&2
+    log $msg
+}
+
+print_usage() {
+    cat << EOF
+usage: $(basename $0) PATH_TO_WALLPAPER_DIRECTORY INTERVAL_IN_SECONDS [FALLBACK_DIRECTORY]
+EOF
+}
+
+detect_screens() {
+    local screencount
+    screencount=$(xrandr | awk '{if ($2 == "connected") {c+=1}} END{print c}')
+    echo $screencount
+}
+
+get_picture_list() {
+    picture_list=()
+    while IFS= read -d $'\0' -r file ; do
+        picture_list+=("$file")
+    done < <(find -H "$1" \( -name "*.jpg" -o -name "*.jpeg" -o -name "*.png" \) -print0)
+    # -H resolves symbolic links for command line arguments only.
+}
+
+set_wallpaper() {
+    output "[I] Setting wallpaper \"${pic_array[@]}\"."
+    if fehoutput=$(feh --bg-fill --no-fehbg "${pic_array[@]}" 2>&1); then
+        output "[I] Wallpaper set."
+    else
+        error "Setting wallpaper failed:\n\n${fehoutput}\n\n[E] Skipping."
+        return 1
+    fi
+}
+
+randomize_wallpaper() {
+    pic_array=()
+    output "[I] Randomizing wallpapers."
+    for (( i=0; i<$screencount; i++ )) ; do
+        pic_array[$i]="${picture_list[$RANDOM % ${#picture_list[@]}]}"
+    done
+}
+
+next_wallpaper() {
+    randomize_wallpaper
+    set_wallpaper
+}
+
+reload_wallpaper() {
+    output "[I] Reloading wallpapers."
+    oldscreens=$screencount
+    screencount=$(detect_screens)
+    echo $oldscreens
+    echo $screencount
+    if (( $oldscreens != $screencount )) ; then
+        randomize_wallpaper
+    fi
+    set_wallpaper
+}
+
+fallback_mode=0
+
+if [[ -z "$FOLDER" ]]; then
+    print_usage
+    exit 1
+elif [[ ! -d "$FOLDER" ]]; then
+    error "\"$FOLDER\" is not a directory. Using fallback directory instead."
+    if [[ -z "$FALLBACK" ]]; then
+        error "Fallback directory not specified. Aborting."
+        exit 1
+    elif [[ ! -d "$FALLBACK" ]]; then
+        error "\"$FALLBACK\" is not a directory. Aborting."
+        exit 1
+    fi
+    FOLDER="$FALLBACK"
+    fallback_mode=1
+fi
+
+if [[ -z "$TIMEOUT" ]]; then
+    TIMEOUT=0
+else
+    if [[ ! $TIMEOUT =~ ^[0-9]+$ ]]; then
+        error "Timeout \"$TIMEOUT\" is invalid."
+        exit 1
+    fi
+fi
+
+screencount="$(detect_screens)"
+output "[I] $screencount screens detected."
+
+output "[I] Looking for pictures in \"$1\""
+get_picture_list "$FOLDER"
+
+pics_count="${#picture_list[@]}"
+output "[I] $pics_count pictures found."
+
+if [[ "$pics_count" -eq 0 ]]; then
+    error  "No suitable wallpapers found. Aborting"
+    exit 1
+elif [[ "$pics_count" -lt "$screencount" ]]; then
+    output "[W] Not enough wallpapers for every screen found."
+    # setting TIMEOUT to 0 so the while loop aborts
+    TIMEOUT=0
+elif [[ "$pics_count" -eq "$screencount" ]]; then
+    output "[W] Only found one wallpaper for every screen. Will just set the wallpaper once."
+    TIMEOUT=0
+fi
+
+reload=0
+trap ":" SIGUSR1
+trap "reload=1" SIGUSR2
+
+while : ; do
+    if (( $reload == 0 )); then
+        next_wallpaper || { sleep 1 ; continue ; } # retry after 1 second delay
+    else
+        reload_wallpaper
+        reload=0
+    fi
+    if [[ -z "$TIMEOUT" || "$TIMEOUT" == "0" ]]; then
+        output "[I] No timeout given. Done."
+        break
+    fi
+    if [[ "$fallback_mode" == "1" ]]; then
+        output "[I] No cycling in fallback mode. Done."
+        break
+    fi
+    output "[I] Sleeping for $TIMEOUT seconds."
+    sleep $TIMEOUT 2>/dev/null &
+    wait
+    output "[I] Waking up."
+done
+
